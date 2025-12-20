@@ -5,28 +5,32 @@ import urllib.parse
 import urllib.request
 import logging
 from http.server import BaseHTTPRequestHandler
+from typing import Any, Dict, Optional, Tuple
 
+# ------------------------------------------------------------
+# Логирование
+# ------------------------------------------------------------
 if not logging.getLogger().handlers:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-
 logger = logging.getLogger(__name__)
 
-# ----------------------------
-# 1) Мини-загрузчик .env
-# ----------------------------
+# ------------------------------------------------------------
+# 1) Мини-загрузчик .env (локально удобно; на Vercel env задаются в UI)
+# ------------------------------------------------------------
 def load_dotenv(path: str = ".env") -> None:
     """
-    Очень простой парсер .env:
-    - читает строки KEY=VALUE
-    - игнорирует пустые строки и комментарии #
-    - значения кладёт в os.environ, если их там ещё нет
+    Простой парсер .env:
+      KEY=VALUE
+    Игнорирует пустые строки и комментарии (#).
+    Не перетирает уже существующие переменные окружения.
     """
     if not os.path.exists(path):
         logger.info(".env not found at %s, skipping", path)
         return
+
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -44,22 +48,31 @@ def load_dotenv(path: str = ".env") -> None:
 
 load_dotenv()
 
-# ----------------------------
+# ------------------------------------------------------------
 # 2) Настройки из окружения
-# ----------------------------
+# ------------------------------------------------------------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 FAMILY_CHAT_ID = int(os.environ["FAMILY_CHAT_ID"])
 
-# Секрет только для Telegram webhook (X-Telegram-Bot-Api-Secret-Token).
+# Секрет ТОЛЬКО для Telegram webhook (X-Telegram-Bot-Api-Secret-Token)
 TG_SECRET = os.environ.get("TG_SECRET", "").strip()
 
-# (Опционально) Секрет/ключ для Алисы. В Диалогах нет обязательного общего "секретного заголовка",
-# поэтому по умолчанию мы НЕ проверяем. Если хочешь — можешь прокинуть свой shared secret
-# и проверять его по заголовку X-Api-Key (или любому другому, который ты сам выставишь на прокси).
+# (опционально) Секрет для запросов от твоего прокси/инфры (если хочешь защитить Алису доп.ключом)
+# Тогда ты сам должен отправлять заголовок X-Api-Key: <ALICE_SECRET> со своей стороны.
 ALICE_SECRET = os.environ.get("ALICE_SECRET", "").strip()
 
-# Маппинг имён из env:
-# NAME_ALIASES=илье:Ильи,илью:Ильи,илья:Ильи,веронике:Веронике,...
+# (опционально) allowlist пользователей Яндекса по session.user_id
+# Пример: ALLOWED_YANDEX_USER_IDS=AAABBB,CCCDDD
+ALLOWED_YANDEX_USER_IDS = {
+    x.strip()
+    for x in os.environ.get("ALLOWED_YANDEX_USER_IDS", "").split(",")
+    if x.strip()
+}
+
+# Маппинг имён (чтобы сделать "Для Ильи" и т.п.)
+# ВАЖНО: "Для <кого?>" — это родительный падеж, поэтому алиасы стоит хранить уже в нужном падеже.
+# Пример:
+# NAME_ALIASES=илья:Ильи,илье:Ильи,илью:Ильи,веронике:Вероники
 RAW_ALIASES = os.environ.get("NAME_ALIASES", "").strip()
 
 
@@ -68,11 +81,11 @@ def normalize_text(s: str) -> str:
     return (s or "").strip().lower().replace("ё", "е")
 
 
-def parse_aliases(raw: str) -> dict:
+def parse_aliases(raw: str) -> Dict[str, str]:
     """
-    "илье:Ильи,веронике:Веронике" -> {"илье":"Ильи", "веронике":"Веронике"}
+    "илье:Ильи,веронике:Вероники" -> {"илье":"Ильи", "веронике":"Вероники"}
     """
-    out = {}
+    out: Dict[str, str] = {}
     if not raw:
         return out
     for part in raw.split(","):
@@ -90,16 +103,19 @@ def parse_aliases(raw: str) -> dict:
 
 NAME_ALIASES = parse_aliases(RAW_ALIASES)
 
-# ----------------------------
+# ------------------------------------------------------------
 # 3) Telegram API helper
-# ----------------------------
-def tg_api(method: str, payload: dict) -> dict:
-    logger.info("Calling Telegram API method %s", method)
+# ------------------------------------------------------------
+def tg_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Вызов Telegram Bot API стандартной библиотекой (без requests).
+    """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     data = urllib.parse.urlencode(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     with urllib.request.urlopen(req, timeout=10) as resp:
         raw = resp.read().decode("utf-8")
+
     try:
         result = json.loads(raw)
         if not result.get("ok", False):
@@ -120,23 +136,23 @@ def tg_leave_chat(chat_id: int) -> None:
     tg_api("leaveChat", {"chat_id": chat_id})
 
 
-# ----------------------------
-# 4) Парсинг фразы "передай ..."
-# ----------------------------
+# ------------------------------------------------------------
+# 4) Парсинг команд "передай/попроси"
+# ------------------------------------------------------------
 # Поддерживаем:
 # - "передай илье купить что-то"
 # - "алиса передай илье купить что-то"
-# - "попроси илью настроить бота" (если хочешь)
+# - "попроси илью настроить бота"
 CMD_RE = re.compile(
     r"^(?:алиса[\s,:\-]*)?(?:передай|попроси)\s+(\S+)\s+(.+)$",
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 
 
 def canonical_name(raw_name: str) -> str:
     """
-    Через алиасы можно добиться нужного падежа.
-    Например: илье:Ильи -> будет "Для Ильи".
+    Приводим имя к нужному виду через алиасы.
+    Если алиаса нет — просто делаем первую букву заглавной (падеж не исправляет).
     """
     key = normalize_text(raw_name)
     if key in NAME_ALIASES:
@@ -145,8 +161,10 @@ def canonical_name(raw_name: str) -> str:
     return n[:1].upper() + n[1:] if n else n
 
 
-def parse_pereday(text: str):
-    """Возвращает (to_name, message) или None."""
+def parse_forward_command(text: str) -> Optional[Tuple[str, str]]:
+    """
+    Возвращает (to_name, message) или None.
+    """
     t = (text or "").strip()
     if not t:
         return None
@@ -158,6 +176,7 @@ def parse_pereday(text: str):
     to_raw = m.group(1).strip()
     msg = m.group(2).strip()
 
+    # уберём ведущие двоеточия/тире после имени
     msg = re.sub(r"^[\s:\-]+", "", msg).strip()
 
     # "передай илье что я дома" -> "я дома"
@@ -171,36 +190,67 @@ def parse_pereday(text: str):
 
 
 def format_out(to_name: str, msg: str) -> str:
-    # пример: "Для Ильи\nкупить что-то"
+    # Пример, как ты хочешь:
+    # "Для Ильи\nкупить что-то"
     return f"Для {to_name}\n{msg.strip()}"
 
 
-# ----------------------------
-# 5) Отличаем Telegram update от Яндекс Диалогов
-# ----------------------------
-def is_yandex_dialogs_payload(obj: dict) -> bool:
+# ------------------------------------------------------------
+# 5) Яндекс Диалоги (Алиса): распознавание payload и ответы
+# ------------------------------------------------------------
+def is_yandex_dialogs_payload(obj: Dict[str, Any]) -> bool:
     """
-    У Диалогов обычно есть meta/request/session/version.
+    Диалоги присылают JSON с полями meta/request/session/version.
+    Мы используем более мягкую проверку: request + session + version.
     """
-    if not isinstance(obj, dict):
-        return False
     return (
-        "request" in obj
-        and "session" in obj
-        and "version" in obj
+        isinstance(obj, dict)
         and isinstance(obj.get("request"), dict)
         and isinstance(obj.get("session"), dict)
+        and "version" in obj
     )
 
 
-def build_alice_response(request_payload: dict, text: str, end_session: bool = True) -> dict:
+def extract_alice_text(payload: Dict[str, Any]) -> str:
     """
-    Ответ в формате Яндекс Диалогов.
-    Важно вернуть version + response + тот же session (можно целиком).
+    В Диалогах фраза пользователя лежит в request.command (нормализовано).
+    Fallback: original_utterance.
     """
+    req = payload.get("request") or {}
+    return (req.get("command") or req.get("original_utterance") or "").strip()
+
+
+def extract_alice_access_token(headers, payload: Dict[str, Any]) -> str:
+    """
+    После account linking токен обычно приходит:
+      - в заголовке Authorization: Bearer <token>
+      - или в payload.session.user.access_token
+    """
+    auth = headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth.split(" ", 1)[1].strip()
+
+    sess = payload.get("session") or {}
+    user = sess.get("user") or {}
+    tok = user.get("access_token") or ""
+    return (tok or "").strip()
+
+
+def alice_user_allowed(payload: Dict[str, Any]) -> bool:
+    """
+    Если allowlist пустой — разрешаем всем (удобно на этапе разработки).
+    Если задан ALLOWED_YANDEX_USER_IDS — разрешаем только перечисленным user_id.
+    """
+    if not ALLOWED_YANDEX_USER_IDS:
+        return True
+    uid = (payload.get("session") or {}).get("user_id") or ""
+    return uid in ALLOWED_YANDEX_USER_IDS
+
+
+def alice_response_text(payload: Dict[str, Any], text: str, end_session: bool = True) -> Dict[str, Any]:
     return {
-        "version": request_payload.get("version", "1.0"),
-        "session": request_payload.get("session", {}),
+        "version": payload.get("version", "1.0"),
+        "session": payload.get("session", {}),
         "response": {
             "text": text,
             "end_session": end_session,
@@ -208,26 +258,28 @@ def build_alice_response(request_payload: dict, text: str, end_session: bool = T
     }
 
 
-def extract_alice_text(payload: dict) -> str:
+def alice_response_start_linking(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Что пользователь сказал: лучше брать request.command
-    (если вдруг пусто — fallback на original_utterance).
+    Ответ, который запускает привязку аккаунта.
     """
-    req = payload.get("request") or {}
-    return (req.get("command") or req.get("original_utterance") or "").strip()
+    return {
+        "version": payload.get("version", "1.0"),
+        "session": payload.get("session", {}),
+        "start_account_linking": {},
+    }
 
 
-# ----------------------------
-# 6) Обработчик Webhook для Vercel
-# ----------------------------
+# ------------------------------------------------------------
+# 6) Handler (Vercel Python Function)
+# ------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
-    def _ok_text(self):
+    def _ok_text(self, text: str = "ok"):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"ok")
+        self.wfile.write(text.encode("utf-8"))
 
-    def _json(self, status: int, obj: dict):
+    def _json(self, status: int, obj: Dict[str, Any]):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.end_headers()
@@ -235,56 +287,78 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # Healthcheck
-        logger.info("Healthcheck GET from %s", self.client_address)
-        self._ok_text()
+        logger.info("GET %s from %s", self.path, self.client_address)
+        self._ok_text("ok")
 
     def do_POST(self):
-        logger.info("Received POST from %s", self.client_address)
+        logger.info("POST %s from %s", self.path, self.client_address)
 
-        # 1) читаем JSON тела один раз
+        # Читаем тело
         length = int(self.headers.get("content-length", 0))
         raw = self.rfile.read(length) if length > 0 else b"{}"
 
-        # Декодируем безопасно: Диалоги и Telegram шлют UTF-8.
+        # Диалоги и Telegram присылают UTF-8 JSON
         try:
-            raw_text = raw.decode("utf-8")
-            payload = json.loads(raw_text) if raw_text else {}
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
         except Exception:
             logger.exception("Invalid JSON body")
             self._json(400, {"ok": False, "error": "invalid json"})
             return
 
-        # 2) Ветка A: Яндекс Диалоги (Алиса)
+        # ----------------------------
+        # ВЕТКА A: Яндекс Диалоги (Алиса)
+        # ----------------------------
         if is_yandex_dialogs_payload(payload):
-            # (опционально) своя проверка доступа, если ты сам прокидываешь заголовок из прокси
+            # (опционально) доп. защита, если ты сам прокидываешь X-Api-Key через свой прокси
             if ALICE_SECRET:
                 got = self.headers.get("X-Api-Key", "")
                 if got != ALICE_SECRET:
                     logger.warning("Alice request unauthorized (bad X-Api-Key)")
-                    self._json(401, build_alice_response(payload, "Доступ запрещён.", end_session=True))
+                    self._json(200, alice_response_text(payload, "Доступ запрещён.", end_session=True))
                     return
 
             spoken = extract_alice_text(payload)
-            logger.info("Alice command: %s", spoken)
+            token = extract_alice_access_token(self.headers, payload)
+            user_id = (payload.get("session") or {}).get("user_id")
 
-            parsed = parse_pereday(spoken)
-            if parsed:
-                to_name, msg = parsed
-                tg_send_message(FAMILY_CHAT_ID, format_out(to_name, msg))
-                # Алисе отвечаем коротко
-                resp = build_alice_response(payload, f"Ок, передала для {to_name}.", end_session=True)
-            else:
-                resp = build_alice_response(
-                    payload,
-                    "Скажи так: «передай <имя> <сообщение>». Например: «передай Илье купить хлеб».",
-                    end_session=True
+            logger.info(
+                "Alice user_id=%s token_present=%s token_len=%d command=%r",
+                user_id,
+                bool(token),
+                len(token) if token else 0,
+                spoken,
+            )
+
+            # Если токена нет — просим сделать привязку аккаунта
+            if not token:
+                self._json(200, alice_response_start_linking(payload))
+                return
+
+            # Ограничение доступа по allowlist (если задан)
+            if not alice_user_allowed(payload):
+                self._json(200, alice_response_text(payload, "У вас нет доступа к этому навыку.", end_session=True))
+                return
+
+            parsed = parse_forward_command(spoken)
+            if not parsed:
+                self._json(
+                    200,
+                    alice_response_text(
+                        payload,
+                        "Скажи так: «передай <имя> <сообщение>». Например: «передай Илье купить хлеб».",
+                        end_session=True,
+                    ),
                 )
+                return
 
-            self._json(200, resp)
+            to_name, msg = parsed
+            tg_send_message(FAMILY_CHAT_ID, format_out(to_name, msg))
+            self._json(200, alice_response_text(payload, f"Ок, передала для {to_name}.", end_session=True))
             return
 
-        # 3) Ветка B: Telegram webhook (как раньше)
-        # Проверяем секрет ТОЛЬКО если это Telegram.
+        # ----------------------------
+        # ВЕТКА B: Telegram webhook
+        # ----------------------------
         if TG_SECRET:
             got = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
             if got != TG_SECRET:
@@ -292,14 +366,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(401, {"ok": False, "error": "unauthorized"})
                 return
 
-        # Событие "бота добавили в чат" — выйти, если не наш чат
+        # my_chat_member — если бота добавили в чужой чат, выходим
         my_chat_member = payload.get("my_chat_member")
         if isinstance(my_chat_member, dict):
             chat = my_chat_member.get("chat") or {}
             chat_id = chat.get("id")
             if isinstance(chat_id, int) and chat_id != FAMILY_CHAT_ID:
                 tg_leave_chat(chat_id)
-            self._ok_text()
+            self._ok_text("ok")
             return
 
         # Обычное сообщение
@@ -309,19 +383,20 @@ class Handler(BaseHTTPRequestHandler):
         text = message.get("text") or ""
 
         if chat_id != FAMILY_CHAT_ID:
-            self._ok_text()
+            self._ok_text("ok")
             return
 
-        parsed = parse_pereday(text)
+        parsed = parse_forward_command(text)
         if parsed:
             to_name, msg = parsed
             tg_send_message(FAMILY_CHAT_ID, format_out(to_name, msg))
 
-        self._ok_text()
+        self._ok_text("ok")
 
     def log_message(self, format, *args):
-        # глушим дефолтный http.server лог, чтобы не дублировать
+        # чтобы не дублировать стандартный http.server лог
         logger.info("%s - - %s", self.client_address[0], format % args)
 
 
+# Vercel ищет переменную handler
 handler = Handler
