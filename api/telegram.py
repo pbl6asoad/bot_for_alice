@@ -2,6 +2,7 @@ import os
 import json
 import urllib.parse
 import urllib.request
+import re
 import logging
 import uuid
 from http.server import BaseHTTPRequestHandler
@@ -134,6 +135,73 @@ def extract_alice_text(payload: Dict[str, Any]) -> str:
             return joined.strip()
 
     return ""
+
+
+ALICE_TELL_ILYA_RE = re.compile(
+    r"^\s*(?:алиса|алиска)\s*,?\s*скажи\s+иль[ея]\s*,?\s*чтобы\s+(.*)$",
+    re.IGNORECASE,
+)
+VERB_REWRITES = {
+    "купил": "купи",
+    "принес": "принеси",
+    "покрасил": "покрась",
+}
+NOUN_REWRITES = {
+    "макарон": "макароны",
+}
+
+
+def normalize_task_text(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return text
+
+    for src, dst in NOUN_REWRITES.items():
+        text = re.sub(rf"\b{re.escape(src)}\b", dst, text, flags=re.IGNORECASE)
+
+    match = re.match(r"^([A-Za-zА-Яа-яЁё]+)(.*)$", text)
+    if match:
+        word = match.group(1)
+        rest = match.group(2)
+        repl = VERB_REWRITES.get(word.lower())
+        if repl:
+            if word[:1].isupper():
+                repl = repl.capitalize()
+            text = f"{repl}{rest}"
+
+    return text.strip()
+
+
+def build_tg_message(spoken: str) -> str:
+    text = (spoken or "").strip()
+    to_ilya = False
+
+    if text:
+        match = ALICE_TELL_ILYA_RE.match(text)
+        if match:
+            text = match.group(1).strip()
+            to_ilya = True
+
+    text = re.sub(r"^\s*(?:чтобы|чтоб)\s+", "", text, flags=re.IGNORECASE)
+
+    parts = [p.strip() for p in re.split(r"\s*/\s*", text) if p.strip()]
+    if not parts and text:
+        parts = [text]
+
+    tasks = [normalize_task_text(p) for p in parts if p]
+
+    lines = ["🧓 Бабушка просит", "--------"]
+    if to_ilya:
+        lines.append("👤 Илья, пожалуйста:")
+    if not tasks:
+        lines.append("📝 (без текста)")
+    elif len(tasks) == 1:
+        lines.append(f"📝 {tasks[0]}")
+    else:
+        lines.append("📝 Просьбы:")
+        lines.extend(f"• {task}" for task in tasks)
+
+    return "\n".join(lines)
 
 
 def extract_alice_access_token(headers, payload: Dict[str, Any]) -> str:
@@ -294,7 +362,7 @@ class Handler(BaseHTTPRequestHandler):
             # Главное изменение: просто пересылаем фразу как есть
             tg_res = tg_send_message(
                 FAMILY_CHAT_ID,
-                f"🧓 Бабушка просит\n--------\n📝 {spoken}",
+                f"🧓 Бабушка просит, чтобы кто-то: \n--------\n📝 {spoken} ❤️",
             )
             logger.info("Telegram send: ok=%s desc=%r", tg_res.get("ok"), tg_res.get("description"))
 
