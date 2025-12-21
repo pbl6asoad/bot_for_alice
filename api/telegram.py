@@ -56,11 +56,12 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 FAMILY_CHAT_ID = int(os.environ["FAMILY_CHAT_ID"])
 
 # Секрет ТОЛЬКО для Telegram webhook (X-Telegram-Bot-Api-Secret-Token)
-TG_SECRET = os.environ.get("TG_SECRET", "").strip()
+def clean_env(v: str) -> str:
+    # убираем пробелы, CRLF и случайные кавычки
+    return (v or "").strip().replace("\r", "").replace("\n", "").strip('"').strip("'").strip()
 
-# (опционально) Секрет для запросов от твоего прокси/инфры (если хочешь защитить Алису доп.ключом)
-# Тогда ты сам должен отправлять заголовок X-Api-Key: <ALICE_SECRET> со своей стороны.
-ALICE_SECRET = os.environ.get("ALICE_SECRET", "").strip()
+TG_SECRET = clean_env(os.environ.get("TG_SECRET", ""))
+
 
 # (опционально) allowlist пользователей Яндекса по session.user_id
 # Пример: ALLOWED_YANDEX_USER_IDS=AAABBB,CCCDDD
@@ -241,6 +242,30 @@ def alice_response_start_linking(payload: Dict[str, Any]) -> Dict[str, Any]:
         "session": payload.get("session", {}),
         "start_account_linking": {},
     }
+import hashlib
+
+# ...
+
+if TG_SECRET:
+    got = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    got_clean = clean_env(got)
+
+    if got_clean != TG_SECRET:
+        # покажем только длину и sha256-хеш, секрета не светим
+        def h(s: str) -> str:
+            return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+        self._json(401, {
+            "ok": False,
+            "error": "unauthorized",
+            "debug": {
+                "got_len": len(got_clean),
+                "expected_len": len(TG_SECRET),
+                "got_sha256": h(got_clean),
+                "expected_sha256": h(TG_SECRET),
+            }
+        })
+        return
 
 
 # ------------------------------------------------------------
@@ -272,10 +297,7 @@ class Handler(BaseHTTPRequestHandler):
         req_id = str(uuid.uuid4())
 
         # debug можно включить заголовком X-Debug: 1
-        # если ALICE_SECRET задан — дополнительно нужно X-Api-Key: <ALICE_SECRET>
-        debug_on = (self.headers.get("X-Debug", "") == "1") and (
-            (not ALICE_SECRET) or (self.headers.get("X-Api-Key", "") == ALICE_SECRET)
-        )
+
 
         # Читаем тело
         length = int(self.headers.get("content-length", 0))
