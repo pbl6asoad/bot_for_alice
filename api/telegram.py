@@ -292,7 +292,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             # Главное изменение: просто пересылаем фразу как есть
-            tg_res = tg_send_message(FAMILY_CHAT_ID, spoken)
+            tg_res = tg_send_message(FAMILY_CHAT_ID, f"Бабушка просит {spoken}")
             logger.info("Telegram send: ok=%s desc=%r", tg_res.get("ok"), tg_res.get("description"))
 
             # Минимальный ответ
