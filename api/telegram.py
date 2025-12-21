@@ -60,6 +60,7 @@ TG_SECRET = os.environ.get("TG_SECRET", "").strip()
 # (опционально) Секрет для запросов от твоего прокси/инфры (если хочешь защитить Алису доп.ключом)
 # Тогда ты сам должен отправлять заголовок X-Api-Key: <ALICE_SECRET> со своей стороны.
 ALICE_SECRET = os.environ.get("ALICE_SECRET", "").strip()
+debug_on = (self.headers.get("X-Debug", "") == "1") and (not ALICE_SECRET or self.headers.get("X-Api-Key", "") == ALICE_SECRET)
 
 # (опционально) allowlist пользователей Яндекса по session.user_id
 # Пример: ALLOWED_YANDEX_USER_IDS=AAABBB,CCCDDD
@@ -273,17 +274,24 @@ def alice_response_start_linking(payload: Dict[str, Any]) -> Dict[str, Any]:
 # 6) Handler (Vercel Python Function)
 # ------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
-    def _ok_text(self, text: str = "ok"):
+    def _ok_text(self, text: str = "ok", extra_headers: dict | None = None):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, str(v))
         self.end_headers()
         self.wfile.write(text.encode("utf-8"))
 
-    def _json(self, status: int, obj: Dict[str, Any]):
+    def _json(self, status: int, obj: dict, extra_headers: dict | None = None):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, str(v))
         self.end_headers()
         self.wfile.write(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
 
     def do_GET(self):
         # Healthcheck
@@ -292,6 +300,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         logger.info("POST %s from %s", self.path, self.client_address)
+        req_id = str(uuid.uuid4())
 
         # Читаем тело
         length = int(self.headers.get("content-length", 0))
