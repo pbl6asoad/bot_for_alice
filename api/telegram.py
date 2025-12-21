@@ -55,13 +55,16 @@ def clean_env(v: str) -> str:
 TG_SECRET = clean_env(os.environ.get("TG_SECRET", ""))
 
 # (опционально) allowlist пользователей Яндекса по session.user_id
+# Пример: ALLOWED_YANDEX_USER_IDS=AAABBB,CCCDDD
 ALLOWED_YANDEX_USER_IDS = {
     x.strip()
     for x in os.environ.get("ALLOWED_YANDEX_USER_IDS", "").split(",")
     if x.strip()
 }
 
-# Маппинг имён в нужном падеже:
+# Маппинг имён (чтобы сделать "Для Ильи" и т.п.)
+# ВАЖНО: "Для <кого?>" — это родительный падеж, поэтому алиасы стоит хранить уже в нужном падеже.
+# Пример:
 # NAME_ALIASES=илья:Ильи,илье:Ильи,илью:Ильи,веронике:Вероники
 RAW_ALIASES = os.environ.get("NAME_ALIASES", "").strip()
 
@@ -142,7 +145,10 @@ def parse_forward_command(text: str) -> Optional[Tuple[str, str]]:
     to_raw = m.group(1).strip()
     msg = m.group(2).strip()
 
+    # уберём ведущие двоеточия/тире после имени
     msg = re.sub(r"^[\s:\-]+", "", msg).strip()
+
+    # "передай илье что я дома" -> "я дома"
     if normalize_text(msg).startswith("что "):
         msg = msg.split(" ", 1)[1].strip()
 
@@ -170,11 +176,12 @@ def extract_alice_text(payload: Dict[str, Any]) -> str:
     return (req.get("command") or req.get("original_utterance") or "").strip()
 
 def extract_alice_access_token(headers, payload: Dict[str, Any]) -> str:
+    # Алиса обычно шлёт Authorization: Bearer ...
     auth = headers.get("Authorization", "") or headers.get("authorization", "")
     if auth.startswith("Bearer "):
         return auth.split(" ", 1)[1].strip()
 
-    # На всякий случай: иногда токен кладут иначе
+    # На всякий случай (иногда токен кладут иначе)
     sess = payload.get("session") or {}
     user = sess.get("user") or {}
     tok = user.get("access_token") or ""
@@ -204,20 +211,22 @@ def alice_response_start_linking(payload: Dict[str, Any]) -> Dict[str, Any]:
 # 6) Telegram update: распознавание и защита от дублей
 # ------------------------------------------------------------
 def is_telegram_update(payload: Dict[str, Any]) -> bool:
-    # Telegram update обычно содержит update_id
-    return isinstance(payload, dict) and ("update_id" in payload or "message" in payload or "my_chat_member" in payload)
+    # Делаем проверку строгой, чтобы Алису случайно не принять за Telegram.
+    return isinstance(payload, dict) and "update_id" in payload
 
 def telegram_secret_ok(headers) -> bool:
     if not TG_SECRET:
         return True
-    got = clean_env(headers.get("X-Telegram-Bot-Api-Secret-Token", "") or headers.get("x-telegram-bot-api-secret-token", ""))
+    got = clean_env(
+        headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        or headers.get("x-telegram-bot-api-secret-token", "")
+    )
     return got == TG_SECRET
 
 def is_from_bot(message: Dict[str, Any]) -> bool:
     frm = message.get("from") or {}
     if isinstance(frm, dict) and frm.get("is_bot") is True:
         return True
-    # Иногда прилетает sender_chat, или via_bot — это тоже можно считать “не от человека”
     if message.get("via_bot"):
         return True
     if message.get("sender_chat"):
@@ -225,7 +234,7 @@ def is_from_bot(message: Dict[str, Any]) -> bool:
     return False
 
 # ------------------------------------------------------------
-# 7) Handler
+# 7) Handler (Vercel Python Function)
 # ------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     def _ok_text(self, text: str = "ok", extra_headers: Optional[Dict[str, str]] = None):
@@ -253,34 +262,54 @@ class Handler(BaseHTTPRequestHandler):
         req_id = str(uuid.uuid4())
         debug_on = clean_env(self.headers.get("X-Debug", "")) == "1"
 
+        logger.info("Received POST from %s", getattr(self, "client_address", None))
+
         length = int(self.headers.get("content-length", 0))
         raw = self.rfile.read(length) if length > 0 else b"{}"
 
         try:
             payload = json.loads(raw.decode("utf-8")) if raw else {}
         except Exception:
+            logger.warning("Invalid JSON from %s", getattr(self, "client_address", None))
             self._json(400, {"ok": False, "error": "invalid json"}, extra_headers={"X-Req-Id": req_id})
             return
 
         # ----------------------------
-        # ВЕТКА A: Алиса
+        # ВЕТКА A: Яндекс Диалоги (Алиса) — ПЕРВОЙ!
+        # НИКАКОГО TG_SECRET тут быть не должно.
         # ----------------------------
         if is_yandex_dialogs_payload(payload):
             spoken = extract_alice_text(payload)
             token = extract_alice_access_token(self.headers, payload)
             user_id = (payload.get("session") or {}).get("user_id")
 
+            logger.info("Alice request: user_id=%s, command=%r, token_present=%s", user_id, spoken, bool(token))
+
+            # Если хочешь УБРАТЬ обязательную привязку — просто закомментируй этот блок.
             if not token:
                 resp = alice_response_start_linking(payload)
                 if debug_on:
-                    resp["debug"] = {"req_id": req_id, "is_alice": True, "token_present": False, "user_id": user_id, "command": spoken}
+                    resp["debug"] = {
+                        "req_id": req_id,
+                        "is_alice": True,
+                        "token_present": False,
+                        "user_id": user_id,
+                        "command": spoken,
+                    }
                 self._json(200, resp, extra_headers={"X-Req-Id": req_id})
                 return
 
             if not alice_user_allowed(payload):
                 resp = alice_response_text(payload, "У вас нет доступа к этому навыку.", end_session=True)
                 if debug_on:
-                    resp["debug"] = {"req_id": req_id, "is_alice": True, "token_present": True, "user_id": user_id, "command": spoken, "reason": "user_not_allowed"}
+                    resp["debug"] = {
+                        "req_id": req_id,
+                        "is_alice": True,
+                        "token_present": True,
+                        "user_id": user_id,
+                        "command": spoken,
+                        "reason": "user_not_allowed",
+                    }
                 self._json(200, resp, extra_headers={"X-Req-Id": req_id})
                 return
 
@@ -292,24 +321,41 @@ class Handler(BaseHTTPRequestHandler):
                     end_session=True,
                 )
                 if debug_on:
-                    resp["debug"] = {"req_id": req_id, "is_alice": True, "token_present": True, "user_id": user_id, "command": spoken, "parsed": None}
+                    resp["debug"] = {
+                        "req_id": req_id,
+                        "is_alice": True,
+                        "token_present": True,
+                        "user_id": user_id,
+                        "command": spoken,
+                        "parsed": None,
+                    }
                 self._json(200, resp, extra_headers={"X-Req-Id": req_id})
                 return
 
             to_name, msg = parsed
-            sent_ok = tg_send_message(FAMILY_CHAT_ID, format_out(to_name, msg))
+            out_text = format_out(to_name, msg)
+            sent_ok = tg_send_message(FAMILY_CHAT_ID, out_text)
 
             resp = alice_response_text(payload, f"Ок, передала для {to_name}.", end_session=True)
             if debug_on:
-                resp["debug"] = {"req_id": req_id, "is_alice": True, "token_present": True, "user_id": user_id, "command": spoken, "parsed": [to_name, msg], "telegram_sent_ok": sent_ok}
+                resp["debug"] = {
+                    "req_id": req_id,
+                    "is_alice": True,
+                    "token_present": True,
+                    "user_id": user_id,
+                    "command": spoken,
+                    "parsed": [to_name, msg],
+                    "telegram_sent_ok": sent_ok,
+                }
             self._json(200, resp, extra_headers={"X-Req-Id": req_id})
             return
 
         # ----------------------------
-        # ВЕТКА B: Telegram webhook
+        # ВЕТКА B: Telegram webhook — ТОЛЬКО ТУТ секрет
         # ----------------------------
         if is_telegram_update(payload):
             if not telegram_secret_ok(self.headers):
+                logger.warning("Unauthorized POST: bad secret token from %s", getattr(self, "client_address", None))
                 self._json(401, {"ok": False, "error": "unauthorized"}, extra_headers={"X-Req-Id": req_id})
                 return
 
@@ -327,7 +373,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._ok_text("ok", extra_headers={"X-Req-Id": req_id})
                 return
 
-            # 🔥 Главный анти-дубль: игнорируем сообщения, которые отправил бот (и похожие системные источники)
+            # Анти-дубль: игнорируем сообщения, которые отправил бот
             if is_from_bot(message):
                 self._ok_text("ok", extra_headers={"X-Req-Id": req_id})
                 return
@@ -343,8 +389,6 @@ class Handler(BaseHTTPRequestHandler):
             parsed = parse_forward_command(text)
             if parsed:
                 to_name, msg = parsed
-                # Важно: если ты хочешь, чтобы команда в чате превращалась в новое сообщение,
-                # это место верное. Если не хочешь дублей — анти-дубль выше должен спасти.
                 tg_send_message(FAMILY_CHAT_ID, format_out(to_name, msg))
 
             self._ok_text("ok", extra_headers={"X-Req-Id": req_id})
@@ -353,6 +397,7 @@ class Handler(BaseHTTPRequestHandler):
         # ----------------------------
         # ИНАЧЕ: неизвестный POST
         # ----------------------------
+        logger.warning("Unknown payload keys=%s", list(payload.keys()) if isinstance(payload, dict) else type(payload))
         self._json(400, {"ok": False, "error": "unknown payload"}, extra_headers={"X-Req-Id": req_id})
 
     def log_message(self, format, *args):
